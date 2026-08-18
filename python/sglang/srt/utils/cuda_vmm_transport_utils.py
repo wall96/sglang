@@ -802,20 +802,49 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
         group_start = parallel.attn_cp_rank * parallel.attn_tp_size
         group_end = group_start + parallel.attn_tp_size
         if not 0 <= group_start < group_end <= self.consumer_count:
-            raise ValueError(
-                "attention group range "
-                f"[{group_start}, {group_end}) is outside "
-                f"consumer_count={self.consumer_count}"
+            # A live attention subgroup that doesn't fit inside the consumer
+            # count captured when the tokenizer created this proxy means the
+            # DP-attention/CP grouping shifted between publish and consume.
+            # Raising here used to propagate out of reconstruct_on_target_device
+            # on whichever single TP rank owns this image (Kimi-K3's
+            # single-owner-acks-for-the-group design), silently diverging that
+            # rank from its SPMD peers for the rest of the forward pass -- the
+            # other ranks proceed into the next cross-rank collective (e.g. the
+            # K3 AR-fusion pull barrier, which has no timeout) and hang forever
+            # waiting for a rank that already returned. Acknowledging the full
+            # range instead keeps every rank on the same control-flow path and
+            # only costs the (already rare) mismatched case a slightly wider
+            # ack than strictly necessary -- never a stranded lease.
+            logger.warning(
+                "CUDA VMM ack: attention group range [%d, %d) does not fit "
+                "consumer_count=%d (attn_cp_rank=%d, attn_tp_size=%d); "
+                "falling back to acknowledging the full range instead of "
+                "raising, to avoid stranding this rank out of the SPMD "
+                "collective sequence.",
+                group_start,
+                group_end,
+                self.consumer_count,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_size,
             )
+            return 0, self.consumer_count
         if consumer_count == 1:
             slot = group_start + parallel.attn_tp_rank
             return slot, slot + 1
         if consumer_count == parallel.attn_tp_size:
             return group_start, group_end
-        raise ValueError(
-            "consumer_count must be 1, the attention TP size, or the full "
-            f"consumer count ({self.consumer_count}); got {consumer_count}"
+        # Same reasoning as above: an unrecognized consumer_count is a live
+        # subgroup mismatch, not a caller bug worth crashing this rank's
+        # forward pass over. Fall back to the full range rather than raising.
+        logger.warning(
+            "CUDA VMM ack: consumer_count=%d is neither 1, the attention TP "
+            "size (%d), nor the full consumer count (%d); falling back to "
+            "acknowledging the full range instead of raising.",
+            consumer_count,
+            parallel.attn_tp_size,
+            self.consumer_count,
         )
+        return 0, self.consumer_count
 
     def _resolve_consumer_count(self, consumer_count: int | None) -> int:
         return 1 if consumer_count is None else consumer_count
