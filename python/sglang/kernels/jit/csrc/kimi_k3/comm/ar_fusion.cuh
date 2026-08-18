@@ -405,6 +405,33 @@ struct PullParams {
   uint32_t num_norm_rows;
 };
 
+// ★deadlock hardening (see incident: cuda_vmm multimodal transport can raise
+// on one rank mid-forward -- e.g. a stale attention-subgroup mismatch in
+// CudaVmmTensorTransportProxy._acknowledgement_range -- silently dropping
+// that rank out of this SPMD collective while its peers proceed into the
+// wait below). Both pull_barrier_enter/exit spins were previously unbounded:
+// a single missing arrival hung every other rank on this GPU forever, with
+// no timeout, no error, nothing in the logs. Cap the spin at a generous
+// cycle budget and __trap() on expiry so a missing peer becomes a fast,
+// loud process crash (self-healing via the usual pod-restart path) instead
+// of a silent, permanent hang.
+//
+// NOTE(needs hardware calibration before merge): clock64() cycles, not
+// wall-clock seconds, and its rate varies with SM clock/throttling. The
+// budget below assumes ~2 GHz and targets roughly 30s, which should sit
+// well above any legitimate stall this barrier sees in practice -- but it
+// has not been measured against a real GB300 run. Whoever owns this kernel
+// should confirm the threshold doesn't false-trip under real load (e.g. a
+// slow-but-not-stuck peer under heavy concurrent multimodal traffic) before
+// this ships, and adjust kPullBarrierSpinCycleLimit accordingly.
+static constexpr int64_t kPullBarrierSpinCycleLimit = 60LL * 1000 * 1000 * 1000;  // ~30s @ 2GHz
+
+SGL_DEVICE void pull_barrier_spin_or_trap(bool expired) {
+  if (expired) {
+    __trap();
+  }
+}
+
 // K3 pull barriers reuse the v2 pull-semaphore slots with EXACTLY the
 // generic kernels' reservation protocol — reserve a 2 * world_size flag
 // window on the local m_counter, signal arrival on m_flag, wait for the
@@ -439,8 +466,10 @@ SGL_DEVICE uint32_t pull_barrier_enter(const PullParams& params) {
     current = reserved + params.world_size;
     device::PDLWaitPrimary<kUsePDL>();
     multimem_red_add_relaxed(pull_sem_mc_flag(params.sem_mc, blockIdx.x));
-    while (semaphore->get_relaxed() - reserved < params.world_size)
-      ;
+    const int64_t deadline = clock64() + kPullBarrierSpinCycleLimit;
+    while (semaphore->get_relaxed() - reserved < params.world_size) {
+      pull_barrier_spin_or_trap(clock64() > deadline);
+    }
   }
   __syncthreads();
   return current;
@@ -456,8 +485,10 @@ SGL_DEVICE void pull_barrier_exit(const PullParams& params, uint32_t current) {
   if (threadIdx.x == 0) {
     const auto semaphore = &params.sem_local[blockIdx.x];
     multimem_red_add_release(pull_sem_mc_flag(params.sem_mc, blockIdx.x));
-    while (semaphore->get_acquire() - current < params.world_size)
-      ;
+    const int64_t deadline = clock64() + kPullBarrierSpinCycleLimit;
+    while (semaphore->get_acquire() - current < params.world_size) {
+      pull_barrier_spin_or_trap(clock64() > deadline);
+    }
   }
 }
 
